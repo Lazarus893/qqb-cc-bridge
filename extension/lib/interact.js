@@ -116,7 +116,8 @@ export async function click(tabId, params) {
   // Brief settle so navigation starts before we report.
   await new Promise((r) => setTimeout(r, 50))
   const after = (await chrome.tabs.get(tabId)).url
-  return { ok: true, navigated: before !== after, newUrl: after }
+  // Expose viewport coords so the overlay can ripple at the exact click point.
+  return { ok: true, navigated: before !== after, newUrl: after, _coords: { x, y } }
 }
 
 // ── type ─────────────────────────────────────────────────────────────────────

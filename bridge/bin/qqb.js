@@ -106,6 +106,7 @@ const COMMANDS = {
       format: args.flags.format ?? 'png',
       quality: num(args.flags.quality, undefined),
       scale: num(args.flags.scale, 1),
+      clean: bool(args.flags.clean, false),
     }),
   },
   click: {
@@ -252,6 +253,7 @@ function help() {
   lines.push('  --scale 1-2        scale factor (e.g. 0.5 to halve the size)')
   lines.push('  --out PATH         write to a specific path (default /tmp/qqb-screenshots/shot-<id>.png)')
   lines.push('  --base64           keep base64 inline in stdout instead of writing a file')
+  lines.push('  --clean            hide the qqb overlay during capture (clean image)')
   lines.push('')
   lines.push('Env:')
   lines.push('  QQB_BRIDGE_URL     default ws://127.0.0.1:9528')

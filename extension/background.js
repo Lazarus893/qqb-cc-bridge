@@ -15,7 +15,7 @@ import {
   click, typeText, scroll, navigate, waitFor, execJs, readText, screenshot,
   attachTab, detachTab, isAttached, listAttachedTabs,
 } from './lib/interact.js'
-import { pulseOverlay, clearOverlay } from './lib/overlay.js'
+import { pulseOverlay, clearOverlay, logOverlay, setOverlayVisible } from './lib/overlay.js'
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -59,36 +59,82 @@ onMessage(async (msg) => {
 })
 
 async function dispatch(method, params) {
-  // Overlay UX — pulse the breathing indicator on the target tab while the
-  // action runs, with a label naming what's happening. Skipped for methods
-  // that don't actually touch a single tab (list_tabs, takeover, release,
-  // pulse), and best-effort throughout (failure to inject the overlay never
-  // blocks the underlying action).
-  const tabIdForOverlay = OVERLAY_METHODS.has(method)
-    ? await resolveTab(params).catch(() => null)
-    : null
-  if (tabIdForOverlay != null) {
+  // Methods that don't target a single tab — just run.
+  if (method === 'list_tabs')   return listTabs()
+  if (method === 'takeover')    return takeoverTab(params.tabId)
+  if (method === 'release')     return releaseTab(params.tabId)
+  if (method === 'pulse')       return pulseHandler(params)
+
+  // Everything else targets a tab. Resolve once so both the overlay and the
+  // action use the same tabId.
+  const tabId = await resolveTab(params)
+  const label = overlayLabel(method, params)
+
+  // Pulse-before — show the breath in cyan ("working") while the action runs.
+  // Best-effort: failure to inject overlay never blocks the action.
+  if (OVERLAY_METHODS.has(method)) {
     pulseOverlay({
-      tabId: tabIdForOverlay,
-      label: overlayLabel(method, params),
+      tabId,
+      label,
       durationMs: OVERLAY_DURATION_MS_BY_METHOD[method] ?? 1500,
+      status: 'working',
     }).catch(() => {})
   }
 
+  // Special case: screenshot --clean → hide the overlay during capture.
+  const clean = method === 'screenshot' && Boolean(params?.clean)
+  if (clean) await setOverlayVisible({ tabId, visible: false }).catch(() => {})
+
+  const t0 = Date.now()
+  let result, error
+  try {
+    result = await runAction(method, tabId, params)
+  } catch (e) {
+    error = e
+  } finally {
+    if (clean) await setOverlayVisible({ tabId, visible: true }).catch(() => {})
+  }
+
+  const elapsed = Date.now() - t0
+  // Pulse-after / timeline log — paint result in green or red.
+  if (OVERLAY_METHODS.has(method)) {
+    const status = error ? 'error' : 'ok'
+    const logLabel = error
+      ? `${label} · failed (${truncate(error.message, 40)})`
+      : `${label} · ${elapsed}ms`
+    // Ripple at click coords, but don't fire if there was an error.
+    const ripple = (!error && method === 'click' && result?._coords) ? result._coords : undefined
+    pulseOverlay({
+      tabId,
+      label,
+      durationMs: 900,        // brief "done" flash
+      status,
+      ripple,
+      logText: logLabel,
+      logStatus: status,
+    }).catch(() => {})
+  }
+
+  if (error) throw error
+  // Strip internal coord field before returning to caller.
+  if (result && typeof result === 'object' && '_coords' in result) {
+    const { _coords, ...rest } = result
+    return rest
+  }
+  return result
+}
+
+async function runAction(method, tabId, params) {
   switch (method) {
-    case 'list_tabs':         return listTabs()
-    case 'snapshot':          return snapshotTab(await resolveTab(params), params)
-    case 'read_text':         return readText(await resolveTab(params), params)
-    case 'screenshot':        return screenshot(await resolveTab(params), params)
-    case 'click':             return click(await resolveTab(params), params)
-    case 'type':              return typeText(await resolveTab(params), params)
-    case 'scroll':            return scroll(await resolveTab(params), params)
-    case 'navigate':          return navigate(params)
-    case 'wait_for':          return waitFor(await resolveTab(params), params)
-    case 'exec_js':           return execJs(await resolveTab(params), params)
-    case 'takeover':          return takeoverTab(params.tabId)
-    case 'release':           return releaseTab(params.tabId)
-    case 'pulse':             return pulseHandler(params)
+    case 'snapshot':   return snapshotTab(tabId, params)
+    case 'read_text':  return readText(tabId, params)
+    case 'screenshot': return screenshot(tabId, params)
+    case 'click':      return click(tabId, params)
+    case 'type':       return typeText(tabId, params)
+    case 'scroll':     return scroll(tabId, params)
+    case 'navigate':   return navigate({ ...params, tabId })
+    case 'wait_for':   return waitFor(tabId, params)
+    case 'exec_js':    return execJs(tabId, params)
     default: throw new Error(`unknown method: ${method}`)
   }
 }
