@@ -1,0 +1,24 @@
+{
+  "name": "qqb-cc-bridge",
+  "version": "0.1.0",
+  "description": "Bridge daemon between QQ Browser extension and Claude Code (MCP)",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "qqb": "bin/qqb.js",
+    "qqb-cc-bridge": "src/index.js",
+    "qqb-cc-bridge-mcp": "src/mcp-client.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "mcp": "node src/mcp-client.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
