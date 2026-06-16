@@ -192,6 +192,8 @@ qqb screenshot --out /tmp/before.png        # explicit path
 | `qqb navigate <url> [--tab N] [--waitUntil load\|domcontentloaded\|networkidle] [--newTab]` | go to URL |
 | `qqb wait --idle MS \| --url-changes [FROM] \| --url-matches PATTERN \| --selector SEL \| --no-selector SEL [--timeoutMs MS]` | wait for condition |
 | `qqb exec '<expression>' [--tab N] [--awaitPromise true\|false]` | escape-hatch JS |
+| `qqb pulse [--label TEXT] [--duration MS] [--stop] [--destroy]` | manually trigger / clear the breathing overlay (cosmetic) |
+| `qqb pulse [--label TEXT] [--duration MS] [--stop] [--destroy]` | manually trigger / clear the breathing overlay (cosmetic) |
 | `qqb takeover [--tab N]` | attach debugger (USER GESTURE — don't call without explicit consent) |
 | `qqb release [--tab N]` | detach debugger |
 
@@ -199,7 +201,28 @@ Global flags: `--pretty` (indented JSON), `--timeoutMs N`, `--tab N`.
 Output: always JSON to stdout, exit 0 on success / non-zero on error.
 Override daemon URL with `QQB_BRIDGE_URL=ws://...`.
 
-## Reading the snapshot efficiently
+## Breathing overlay (visual feedback)
+
+Every action — snapshot, click, type, screenshot, etc. — automatically
+shows a soft cyan glow pulsing along the viewport edges + a label pill in
+the top-right corner naming the action ("qqb · click n5", "qqb · reading
+page"). This is Atlas-style visual feedback so the human watching the
+browser always knows the agent is touching the page.
+
+You don't need to do anything special — it happens for free. Two cases
+where you *might* call it explicitly:
+
+```bash
+# Demo / get the user's attention before doing something
+qqb pulse --label "qqb · about to delete this row" --duration 3000
+
+# Force-clear an overlay (rare — auto-hide handles it)
+qqb pulse --stop
+```
+
+The overlay is purely cosmetic — never blocks pointer events, never
+appears in screenshots you take of the page (well, it does, since it's
+in the page; if you need a clean screenshot, `qqb pulse --stop` first).
 
 When summarizing a page back to the user, do **not** dump the full tree —
 it's noise. Pick:

@@ -15,6 +15,7 @@ import {
   click, typeText, scroll, navigate, waitFor, execJs, readText, screenshot,
   attachTab, detachTab, isAttached, listAttachedTabs,
 } from './lib/interact.js'
+import { pulseOverlay, clearOverlay } from './lib/overlay.js'
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,22 @@ onMessage(async (msg) => {
 })
 
 async function dispatch(method, params) {
+  // Overlay UX — pulse the breathing indicator on the target tab while the
+  // action runs, with a label naming what's happening. Skipped for methods
+  // that don't actually touch a single tab (list_tabs, takeover, release,
+  // pulse), and best-effort throughout (failure to inject the overlay never
+  // blocks the underlying action).
+  const tabIdForOverlay = OVERLAY_METHODS.has(method)
+    ? await resolveTab(params).catch(() => null)
+    : null
+  if (tabIdForOverlay != null) {
+    pulseOverlay({
+      tabId: tabIdForOverlay,
+      label: overlayLabel(method, params),
+      durationMs: OVERLAY_DURATION_MS_BY_METHOD[method] ?? 1500,
+    }).catch(() => {})
+  }
+
   switch (method) {
     case 'list_tabs':         return listTabs()
     case 'snapshot':          return snapshotTab(await resolveTab(params), params)
@@ -71,8 +88,66 @@ async function dispatch(method, params) {
     case 'exec_js':           return execJs(await resolveTab(params), params)
     case 'takeover':          return takeoverTab(params.tabId)
     case 'release':           return releaseTab(params.tabId)
+    case 'pulse':             return pulseHandler(params)
     default: throw new Error(`unknown method: ${method}`)
   }
+}
+
+// Methods that target a specific tab and benefit from a visible overlay.
+const OVERLAY_METHODS = new Set([
+  'snapshot', 'read_text', 'click', 'type', 'scroll', 'wait_for',
+  'exec_js', 'screenshot', 'navigate',
+])
+
+// Per-method overlay duration. Roughly: how long the action might plausibly
+// take, plus a fade-out beat. wait_for can run for up to 10s by default, so
+// we don't auto-hide it — we let the call's success/failure clear it.
+const OVERLAY_DURATION_MS_BY_METHOD = {
+  snapshot: 1200,
+  read_text: 1200,
+  click: 1500,
+  type: 2000,
+  scroll: 1000,
+  wait_for: 0,        // stays on; refresh on next call
+  exec_js: 1500,
+  screenshot: 1500,
+  navigate: 3000,
+}
+
+function overlayLabel(method, params = {}) {
+  const ref = params.nodeRef ? ` ${params.nodeRef}` : ''
+  switch (method) {
+    case 'snapshot':   return 'qqb · reading page'
+    case 'read_text':  return 'qqb · reading text'
+    case 'screenshot': return params.fullPage ? 'qqb · screenshot (full page)' : `qqb · screenshot${ref}`
+    case 'click':      return `qqb · click${ref}`
+    case 'type':       return `qqb · type${ref}`
+    case 'scroll':     return `qqb · scroll${params.direction ? ' ' + params.direction : ref}`
+    case 'wait_for':   return `qqb · wait (${params.condition?.type ?? 'idle'})`
+    case 'exec_js':    return 'qqb · exec JS'
+    case 'navigate':   return `qqb · navigate ${truncate(params.url, 32)}`
+    default:           return 'qqb · working'
+  }
+}
+
+function truncate(s, n) {
+  if (!s) return ''
+  return s.length > n ? s.slice(0, n - 1) + '…' : s
+}
+
+async function pulseHandler(params = {}) {
+  const tabId = params.tabId ?? (await resolveTab(params).catch(() => null))
+  if (tabId == null) throw new Error('no active tab; specify tabId')
+  if (params.stop) {
+    await clearOverlay({ tabId, destroy: Boolean(params.destroy) })
+    return { ok: true, tabId, stopped: true }
+  }
+  await pulseOverlay({
+    tabId,
+    label: params.label ?? 'qqb · working',
+    durationMs: params.durationMs ?? 2000,
+  })
+  return { ok: true, tabId, label: params.label ?? 'qqb · working', durationMs: params.durationMs ?? 2000 }
 }
 
 // ── Tab management ────────────────────────────────────────────────────────────
@@ -113,6 +188,9 @@ async function takeoverTab(tabId) {
 }
 
 async function releaseTab(tabId) {
+  // Best-effort overlay teardown before debugger detaches — once detached we
+  // can't talk to the page anymore.
+  if (tabId != null) await clearOverlay({ tabId, destroy: true }).catch(() => {})
   await detachTab(tabId)
   pushTabsToBridge()
   return { ok: true }

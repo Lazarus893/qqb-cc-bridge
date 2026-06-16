@@ -22,6 +22,7 @@ Three pieces, one repo:
 - **Navigate / wait** — drive a tab to a URL; wait on idle / url-change / selector
 - **Read article text** — reader-mode body text, cheaper than full snapshot
 - **Screenshot** — viewport / full page / single element. Writes a PNG to `/tmp/qqb-screenshots/`, returns just the path so it doesn't blow up the LLM context.
+- **Breathing UI overlay** — every action automatically pulses a soft cyan glow + label pill on the page (Atlas-style "the agent is touching this"), so the human watching always sees what's happening. Override via `qqb pulse --label "..." --duration N`.
 - **Escape hatch** — `qqb exec '<expr>'` for things AX truly can't answer (canvas, computed style, app internal state)
 
 The Skill teaches Claude: snapshot first → reason about role+name → click by nodeRef → re-snapshot → screenshot only when AX is insufficient.
@@ -130,6 +131,7 @@ qqb scroll                        Scroll viewport / element into view.
 qqb navigate <url>                Drive a tab to a URL.
 qqb wait                          Wait for idle / url change / selector / etc.
 qqb exec   '<expression>'         ESCAPE HATCH — eval JS in the tab.
+qqb pulse  [--label … --duration N]  Manually trigger / clear the breathing overlay.
 qqb takeover                      Attach chrome.debugger (USER gesture; don't auto-call).
 qqb release                       Detach debugger.
 ```

@@ -214,6 +214,17 @@ const COMMANDS = {
     summary: 'Detach chrome.debugger from a tab.',
     build: (args) => ({ tabId: num(args.flags.tab, undefined) }),
   },
+  pulse: {
+    method: 'pulse',
+    summary: 'Manually trigger / clear the breathing overlay (cosmetic, normally automatic).',
+    build: (args) => ({
+      tabId: num(args.flags.tab, undefined),
+      label: args.flags.label,
+      durationMs: num(args.flags.duration, 2000),
+      stop: bool(args.flags.stop, false),
+      destroy: bool(args.flags.destroy, false),
+    }),
+  },
 }
 
 function help() {
