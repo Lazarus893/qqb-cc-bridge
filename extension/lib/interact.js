@@ -4,6 +4,8 @@
 // matters, so synthetic events look closer to real hardware (e.g. login forms
 // that gate on `isTrusted`).
 
+import { cdp } from './cdp.js'
+
 const ATTACHED = new Set()
 const REF_TABLES = new Map() // tabId → { nodeRef → {axId, backendDOMNodeId} }
 const DEBUGGER_PROTOCOL_VERSION = '1.3'
@@ -23,10 +25,13 @@ export async function attachTab(tabId) {
     })
   })
   ATTACHED.add(tabId)
-  await sendDebugger(tabId, 'DOM.enable', {})
-  await sendDebugger(tabId, 'Runtime.enable', {})
-  await sendDebugger(tabId, 'Page.enable', {})
-  await sendDebugger(tabId, 'Accessibility.enable', {})
+  // Domain-enable calls intentionally bypass the retry helper. Reattach is
+  // implemented via attachTab itself; if a transient failure here looped back
+  // through cdp(), we'd recurse. retries:0 keeps it linear.
+  await cdp(tabId, 'DOM.enable', {}, { retries: 0 })
+  await cdp(tabId, 'Runtime.enable', {}, { retries: 0 })
+  await cdp(tabId, 'Page.enable', {}, { retries: 0 })
+  await cdp(tabId, 'Accessibility.enable', {}, { retries: 0 })
 }
 
 export async function detachTab(tabId) {
@@ -42,14 +47,11 @@ export async function ensureAttached(tabId) {
   if (!ATTACHED.has(tabId)) await attachTab(tabId)
 }
 
+// Thin compatibility shim — kept exported so existing importers (overlay.js,
+// ax-tree.js) don't need to change. All CDP traffic now flows through
+// cdp() so transient errors auto-recover.
 export function sendDebugger(tabId, method, params) {
-  return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
-      const err = chrome.runtime.lastError
-      if (err) reject(new Error(`${method}: ${err.message}`))
-      else resolve(result ?? {})
-    })
-  })
+  return cdp(tabId, method, params)
 }
 
 // ── nodeRef ↔ AX node bookkeeping (called from snapshotTab) ──────────────────

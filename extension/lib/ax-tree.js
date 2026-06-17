@@ -1,19 +1,33 @@
-// ax-tree.js — fetch the accessibility tree via CDP, then fold/strip it into a
-// shape that's cheap for an LLM to understand.
+// ax-tree.js — fetch a tree representation of the page via CDP and fold/strip
+// it into a shape that's cheap for an LLM to understand.
 //
-// Compaction rules:
+// Three modes are supported:
+//   • 'ax'    — CDP Accessibility tree (default). Walks cross-frame iframes
+//               and grafts child-frame trees under their owning Iframe nodes.
+//   • 'dom'   — CDP DOM tree. Useful for canvas-heavy / non-semantic pages
+//               where the AX tree returns mostly `generic` / empty-name nodes.
+//   • 'mixed' — Try AX first; if the result looks too thin (fewer than
+//               MIXED_FALLBACK_THRESHOLD named nodes), re-run as DOM and
+//               return that with mode: 'dom-fallback'.
+//
+// AX-mode compaction rules:
 //   • Drop nodes whose role is structural noise (generic, none, presentation,
 //     ScrollArea, GenericContainer) UNLESS they have a name worth keeping.
 //   • Promote children: if a stripped node has children, hoist them to the
 //     parent's children list.
-//   • Truncate names/values longer than ~120 chars.
-//   • Assign a stable `nodeRef` (n0, n1, …) to every node that survives AND is
-//     interactive (button, link, textbox, checkbox, switch, menuitem, tab, …)
-//     or is the canonical root anchor (heading levels).
+//   • Truncate names/values longer than ~200 chars.
+//   • Assign a stable `nodeRef` (n0, n1, …) to every interactive node.
 //   • Hard-cap the result at maxNodes (DFS, depth-first), and tell the caller
 //     how much was elided.
 //
-// Returns { tabId, url, title, etag, nodeCount, truncated, tree }.
+// DOM-mode rules:
+//   • Skip script/style/meta/link/head/noscript/comment nodes.
+//   • Prefer aria-label / aria-labelledby for `name`.
+//   • Capture id / className / value / bbox (bbox only for interactive-ish
+//     nodes — DOM.getBoxModel is expensive).
+//   • Same maxNodes cap and stable nodeRef numbering.
+//
+// Returns { tabId, url, title, mode, etag, nodeCount, frames, truncated, tree }.
 
 import { sendDebugger, ensureAttached, stashRefTable } from './interact.js'
 
@@ -37,78 +51,245 @@ const INFORMATIVE_ROLES = new Set([
   'form', 'dialog', 'alert', 'status', 'tooltip',
 ])
 
+// AX roles that mark an embedded frame in the parent document.
+const FRAME_ROLES = new Set(['Iframe', 'iframe', 'IframePresentational'])
+
 const MAX_NAME_LEN = 200
 const MAX_VALUE_LEN = 200
+
+// DOM tags that are never interesting to walk into.
+const DOM_SKIP_TAGS = new Set([
+  'script', 'style', 'meta', 'link', 'head', 'noscript', 'template',
+])
+
+// DOM tags that look interactive enough to justify a getBoxModel call.
+const DOM_INTERACTIVE_TAGS = new Set([
+  'button', 'a', 'input', 'select', 'textarea',
+])
+
+// "This page is non-semantic" heuristic for mixed-mode fallback.
+export const MIXED_FALLBACK_THRESHOLD = 20
+
+// CDP Node.nodeType constants (matches DOM Node.nodeType).
+const NODE_TYPE_ELEMENT = 1
+const NODE_TYPE_TEXT = 3
+const NODE_TYPE_DOCUMENT = 9
+const NODE_TYPE_DOCUMENT_FRAGMENT = 11
+
+// Hard cap on iframe recursion depth.
+const MAX_FRAME_DEPTH = 3
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Snapshot a tab's AX tree.
+ * Snapshot a tab.
  * @param {number} tabId
- * @param {{ mode?: 'ax'|'text'|'mixed', maxNodes?: number }} opts
+ * @param {{ mode?: 'ax'|'dom'|'mixed', maxNodes?: number }} opts
  */
 export async function snapshotTab(tabId, opts = {}) {
   const mode = opts.mode ?? 'ax'
   const maxNodes = opts.maxNodes ?? 800
 
   await ensureAttached(tabId)
+  await sendDebugger(tabId, 'Accessibility.enable', {}).catch(() => {})
 
   const tab = await chrome.tabs.get(tabId)
-  await sendDebugger(tabId, 'Accessibility.enable', {})
-  const { nodes } = await sendDebugger(tabId, 'Accessibility.getFullAXTree', {})
 
-  const compact = compactAXTree(nodes, { maxNodes })
-  stashRefTable(tabId, compact.refTable)
+  // Per-snapshot ref-counter and ref-table — shared across all modes and
+  // across iframe recursion so every nodeRef is unique within the snapshot.
+  const ctx = {
+    tabId,
+    counter: 0,
+    refTable: {},
+    remaining: maxNodes,
+    truncated: false,
+  }
+
+  let payload
+  if (mode === 'dom') {
+    payload = await runDomSnapshot(ctx)
+    payload.mode = 'dom'
+  } else if (mode === 'mixed') {
+    const ax = await runAxSnapshot(ctx)
+    if (countNamed(ax.tree) < MIXED_FALLBACK_THRESHOLD) {
+      // Reset ctx for the DOM pass so refs start fresh.
+      ctx.counter = 0
+      ctx.refTable = {}
+      ctx.remaining = maxNodes
+      ctx.truncated = false
+      payload = await runDomSnapshot(ctx)
+      payload.mode = 'dom-fallback'
+    } else {
+      payload = ax
+      payload.mode = 'ax'
+    }
+  } else {
+    payload = await runAxSnapshot(ctx)
+    payload.mode = 'ax'
+  }
+
+  stashRefTable(tabId, ctx.refTable)
+
   return {
     tabId,
     url: tab.url,
     title: tab.title,
-    mode,
-    etag: hashEtag(compact.tree),
-    nodeCount: compact.nodeCount,
-    truncated: compact.truncated,
-    tree: compact.tree,
+    mode: payload.mode,
+    etag: hashEtag(payload.tree),
+    nodeCount: payload.nodeCount,
+    frames: payload.frames ?? 0,
+    truncated: ctx.truncated,
+    tree: payload.tree,
   }
 }
 
-// ── AX-tree compaction ────────────────────────────────────────────────────────
+// ── AX-mode driver (with cross-frame iframe walking) ─────────────────────────
+
+async function runAxSnapshot(ctx) {
+  const { tabId } = ctx
+
+  // 1. Pull the frame tree once so we know which frameIds exist.
+  let frameTree = null
+  try {
+    const r = await sendDebugger(tabId, 'Page.getFrameTree', {})
+    frameTree = r?.frameTree ?? null
+  } catch {
+    // Page domain may not be ready; carry on with top-frame only.
+  }
+
+  // 2. Top-level AX tree.
+  const { nodes: topNodes } = await sendDebugger(
+    tabId, 'Accessibility.getFullAXTree', {}
+  )
+  const topCompact = compactAxNodes(topNodes, ctx)
+
+  // 3. Walk child frames (depth-first) and graft them into the top tree.
+  let framesMerged = 0
+  if (frameTree?.childFrames?.length) {
+    framesMerged = await graftChildFrames(
+      ctx, topCompact.tree, frameTree.childFrames, /* depth */ 1
+    )
+  }
+
+  return {
+    tree: topCompact.tree,
+    nodeCount: topCompact.nodeCount,
+    frames: framesMerged,
+  }
+}
+
+/**
+ * Recursively walk `childFrames` from CDP, fetch each frame's AX tree, and
+ * graft each child's compacted children into the matching Iframe leaf in
+ * `parentTree`. Returns the number of frames successfully merged.
+ */
+async function graftChildFrames(ctx, parentTree, childFrames, depth) {
+  if (depth > MAX_FRAME_DEPTH) return 0
+  let merged = 0
+
+  // Collect all Iframe-role leaves in the parent tree, in the order they
+  // appear (DFS). We pair them with childFrames by index — CDP returns them
+  // in document order, so they line up.
+  const iframeLeaves = []
+  collectFrameLeaves(parentTree, iframeLeaves)
+
+  for (let i = 0; i < childFrames.length; i++) {
+    const child = childFrames[i]
+    const frameId = child.frame?.id
+    const target = iframeLeaves[i] ?? null
+
+    let childCompact = null
+    let frameError = null
+    try {
+      if (!frameId) throw new Error('missing frameId')
+      if (ctx.remaining <= 0) throw new Error('node budget exhausted')
+      const { nodes } = await sendDebugger(
+        ctx.tabId, 'Accessibility.getFullAXTree', { frameId }
+      )
+      childCompact = compactAxNodes(nodes, ctx)
+    } catch (e) {
+      frameError = e
+    }
+
+    if (target) {
+      if (childCompact && childCompact.tree.length > 0) {
+        // Graft: append the child frame's roots as children of the iframe.
+        target.children = (target.children ?? []).concat(childCompact.tree)
+        merged++
+      } else {
+        // Cross-origin or otherwise inaccessible: leave a marker.
+        target.children = (target.children ?? []).concat([{
+          role: 'frame',
+          name: '(unavailable)',
+          frameId: frameId ?? null,
+          ...(frameError ? { error: truncateMsg(frameError.message) } : {}),
+        }])
+      }
+    }
+
+    // Recurse into grandchildren regardless of whether we could graft this
+    // level — some pages have nested same-origin frames inside a cross-origin
+    // wrapper.
+    if (child.childFrames?.length && depth < MAX_FRAME_DEPTH) {
+      // For grafting at deeper levels we walk the *child*'s tree, not the
+      // parent's. If the AX call failed we have no tree to graft into, so
+      // skip.
+      if (childCompact && childCompact.tree.length > 0) {
+        merged += await graftChildFrames(
+          ctx, childCompact.tree, child.childFrames, depth + 1
+        )
+      }
+    }
+  }
+  return merged
+}
+
+function collectFrameLeaves(treeOrArray, out) {
+  const arr = Array.isArray(treeOrArray) ? treeOrArray : [treeOrArray]
+  for (const n of arr) {
+    if (!n || typeof n !== 'object') continue
+    if (FRAME_ROLES.has(n.role)) out.push(n)
+    if (n.children?.length) collectFrameLeaves(n.children, out)
+  }
+}
+
+// ── AX-tree compaction (per-frame) ────────────────────────────────────────────
 
 /**
  * Take CDP AXNode[] and produce a folded, named-and-numbered tree.
+ * Honors the shared `ctx` — counter, refTable, remaining (maxNodes), truncated.
+ *
+ * Exported as `compactAXTree` for backward compatibility.
  *
  * CDP AXNode shape (relevant fields):
  *   { nodeId, parentId, childIds:[], backendDOMNodeId,
  *     role:{value}, name:{value}, value:{value},
  *     properties:[{name, value:{value}}], ignored }
  */
-export function compactAXTree(axNodes, { maxNodes }) {
-  // Build id → node map.
+function compactAxNodes(axNodes, ctx) {
   const byId = new Map()
   for (const n of axNodes) byId.set(n.nodeId, n)
 
-  // Find root — the node without a parentId or whose parent is missing.
   let root = axNodes.find((n) => !n.parentId || !byId.has(n.parentId))
   if (!root) root = axNodes[0]
 
-  let counter = 0
-  let total = 0
-  let truncated = false
-
-  function refOf(n) {
-    return 'n' + (counter++).toString(36)
+  function refOf() {
+    return 'n' + (ctx.counter++).toString(36)
   }
 
   function shouldKeep(role, name, value) {
     if (INTERACTIVE_ROLES.has(role)) return true
+    if (FRAME_ROLES.has(role)) return true
     if (INFORMATIVE_ROLES.has(role) && (name || value)) return true
     if (STRUCTURAL_NOISE_ROLES.has(role)) return false
-    return Boolean(name) // unfamiliar role + has a name → keep
+    return Boolean(name)
   }
 
+  let nodeCount = 0
+
   function visit(node) {
-    if (total >= maxNodes) { truncated = true; return null }
+    if (ctx.remaining <= 0) { ctx.truncated = true; return null }
     if (!node || node.ignored) {
-      // descend through ignored
       const out = []
       for (const cid of node?.childIds ?? []) {
         const c = visit(byId.get(cid))
@@ -125,7 +306,6 @@ export function compactAXTree(axNodes, { maxNodes }) {
     const value = trim(rawValue, MAX_VALUE_LEN)
 
     if (!shouldKeep(role, name, value)) {
-      // descend, hoist
       const out = []
       for (const cid of node.childIds ?? []) {
         const c = visit(byId.get(cid))
@@ -135,7 +315,9 @@ export function compactAXTree(axNodes, { maxNodes }) {
       return out.length ? out : null
     }
 
-    total++
+    ctx.remaining--
+    nodeCount++
+
     /** @type {any} */
     const out = { role }
     if (name) out.name = name
@@ -150,12 +332,14 @@ export function compactAXTree(axNodes, { maxNodes }) {
     const url = readProp(node, 'url')
     if (url) out.url = url
 
-    if (INTERACTIVE_ROLES.has(role)) out.nodeRef = refOf(node)
-    // Stash the AX nodeId for the bridge — we strip it on the way out, but we
-    // need a side-table to map nodeRef → AX node so click/type can find the
-    // backendDOMNodeId.
-    out.__axId = node.nodeId
-    out.__backendDOMNodeId = node.backendDOMNodeId
+    if (INTERACTIVE_ROLES.has(role)) {
+      const ref = refOf()
+      out.nodeRef = ref
+      ctx.refTable[ref] = {
+        axId: node.nodeId,
+        backendDOMNodeId: node.backendDOMNodeId,
+      }
+    }
 
     const children = []
     for (const cid of node.childIds ?? []) {
@@ -168,34 +352,221 @@ export function compactAXTree(axNodes, { maxNodes }) {
   }
 
   const tree = visit(root) ?? []
-
-  // Strip __axId and __backendDOMNodeId from the public tree, and stash a
-  // side-table keyed by nodeRef so interact.js can resolve them.
-  const refTable = {}
-  function strip(n) {
-    if (!n) return n
-    if (n.nodeRef) {
-      refTable[n.nodeRef] = {
-        axId: n.__axId,
-        backendDOMNodeId: n.__backendDOMNodeId,
-      }
-    }
-    delete n.__axId
-    delete n.__backendDOMNodeId
-    if (n.children) n.children.forEach(strip)
-    return n
-  }
-  if (Array.isArray(tree)) tree.forEach(strip)
-  else strip(tree)
-
-  // Cache the ref table on globalThis keyed by tabId (set by caller layer).
-  // We return it embedded so the caller can stash it.
   return {
     tree: Array.isArray(tree) ? tree : [tree],
-    nodeCount: total,
-    truncated,
-    refTable,
+    nodeCount,
   }
+}
+
+/**
+ * Backwards-compatible export — the previous public signature.
+ * Takes raw CDP AXNode[] and returns { tree, nodeCount, truncated, refTable }.
+ */
+export function compactAXTree(axNodes, { maxNodes }) {
+  const ctx = { tabId: null, counter: 0, refTable: {}, remaining: maxNodes, truncated: false }
+  const r = compactAxNodes(axNodes, ctx)
+  return {
+    tree: r.tree,
+    nodeCount: r.nodeCount,
+    truncated: ctx.truncated,
+    refTable: ctx.refTable,
+  }
+}
+
+// ── DOM-mode driver ───────────────────────────────────────────────────────────
+
+async function runDomSnapshot(ctx) {
+  const { tabId } = ctx
+
+  // Pull the whole DOM in one shot — CDP supports depth:-1 + pierce:true to
+  // include shadow roots and same-origin iframes.
+  const { root } = await sendDebugger(tabId, 'DOM.getDocument', {
+    depth: -1,
+    pierce: true,
+  })
+
+  const tree = await walkDomNode(ctx, root)
+  // root is a #document — its children carry the actual <html>. Flatten if
+  // we got a single document wrapper.
+  let flattened = tree
+  if (Array.isArray(flattened) && flattened.length === 1 && flattened[0].role === 'document') {
+    flattened = flattened[0].children ?? []
+  } else if (!Array.isArray(flattened) && flattened?.role === 'document') {
+    flattened = flattened.children ?? []
+  }
+  const result = Array.isArray(flattened) ? flattened : [flattened].filter(Boolean)
+
+  // Count nodes in the final tree for the response (recursive).
+  const nodeCount = countNodes(result)
+
+  return {
+    tree: result,
+    nodeCount,
+    frames: 0,
+  }
+}
+
+async function walkDomNode(ctx, node) {
+  if (!node || ctx.remaining <= 0) {
+    if (node && ctx.remaining <= 0) ctx.truncated = true
+    return null
+  }
+
+  const nodeType = node.nodeType
+
+  // Document-ish nodes — descend straight into their children.
+  if (nodeType === NODE_TYPE_DOCUMENT || nodeType === NODE_TYPE_DOCUMENT_FRAGMENT) {
+    const children = await walkChildren(ctx, node)
+    return {
+      role: 'document',
+      ...(children.length ? { children } : {}),
+    }
+  }
+
+  // Text nodes are folded into their parent's `name` field, not emitted on
+  // their own. Skip here.
+  if (nodeType === NODE_TYPE_TEXT) return null
+
+  // Anything else we don't understand (comment, processing instruction, etc.)
+  // — skip.
+  if (nodeType !== NODE_TYPE_ELEMENT) return null
+
+  const tag = (node.localName || node.nodeName || '').toLowerCase()
+  if (DOM_SKIP_TAGS.has(tag)) return null
+
+  const attrs = attrMap(node.attributes)
+
+  // Compute "name" — prefer aria-label, then aria-labelledby (we can't
+  // dereference labelledby cheaply without extra calls; treat its raw value
+  // as a hint), then leaf text content.
+  let name = attrs['aria-label']
+  if (!name && attrs['aria-labelledby']) name = `(labelledby:${attrs['aria-labelledby']})`
+
+  // Recurse into children before deciding leaf-ness.
+  ctx.remaining--
+  const children = await walkChildren(ctx, node)
+
+  if (!name) {
+    // Only fold text into name if every child is text-only (no element kids).
+    const hasElementKid = children.length > 0
+    if (!hasElementKid) {
+      const txt = collectLeafText(node)
+      if (txt) name = txt.slice(0, 80)
+    }
+  }
+
+  /** @type {any} */
+  const out = { role: tag }
+  if (name) out.name = trim(name, MAX_NAME_LEN)
+  const val = attrs['value']
+  if (val != null) out.value = trim(val, MAX_VALUE_LEN)
+  if (attrs.id) out.id = attrs.id
+  if (attrs.class) out.className = trim(attrs.class, 120)
+  if (attrs.href) out.href = trim(attrs.href, 200)
+  if (attrs.role) out.ariaRole = attrs.role
+  if (attrs.type) out.type = attrs.type
+  if (attrs.placeholder) out.placeholder = trim(attrs.placeholder, 120)
+
+  // Every emitted DOM node gets a stable nodeRef — click/type need to be able
+  // to address any node the snapshot exposed, regardless of mode.
+  const ref = 'n' + (ctx.counter++).toString(36)
+  out.nodeRef = ref
+  ctx.refTable[ref] = {
+    // DOM-mode: store CDP nodeId AND backendNodeId. interact.js prefers
+    // backendDOMNodeId via DOM.resolveNode; we get backendNodeId straight
+    // from DOM.getDocument.
+    axId: null,
+    backendDOMNodeId: node.backendNodeId,
+    domNodeId: node.nodeId,
+  }
+
+  // Only call getBoxModel for interactive-ish nodes — it's expensive and
+  // can throw for offscreen elements. Best-effort only.
+  const isInteractive = DOM_INTERACTIVE_TAGS.has(tag) || Boolean(attrs.role)
+  if (isInteractive) {
+    try {
+      const bb = await sendDebugger(ctx.tabId, 'DOM.getBoxModel', {
+        backendNodeId: node.backendNodeId,
+      })
+      const m = bb?.model
+      if (m && m.width > 0 && m.height > 0) {
+        // m.content is [x1,y1, x2,y1, x2,y2, x1,y2]
+        const c = m.content
+        if (Array.isArray(c) && c.length >= 8) {
+          out.bbox = {
+            x: c[0], y: c[1],
+            w: m.width, h: m.height,
+          }
+        }
+      }
+    } catch {
+      // offscreen / non-rendered — skip bbox quietly
+    }
+  }
+
+  if (children.length) out.children = children
+  return out
+}
+
+async function walkChildren(ctx, node) {
+  const out = []
+  // node.children is what we get from DOM.getDocument with depth:-1.
+  // For elements that contain shadow roots, CDP exposes shadowRoots[].
+  const kids = []
+  if (Array.isArray(node.children)) kids.push(...node.children)
+  if (Array.isArray(node.shadowRoots)) kids.push(...node.shadowRoots)
+  if (node.contentDocument) kids.push(node.contentDocument)
+
+  for (const k of kids) {
+    if (ctx.remaining <= 0) { ctx.truncated = true; break }
+    const c = await walkDomNode(ctx, k)
+    if (Array.isArray(c)) out.push(...c)
+    else if (c) out.push(c)
+  }
+  return out
+}
+
+function attrMap(attrArr) {
+  const out = {}
+  if (!Array.isArray(attrArr)) return out
+  for (let i = 0; i < attrArr.length; i += 2) {
+    out[attrArr[i]] = attrArr[i + 1]
+  }
+  return out
+}
+
+function collectLeafText(node) {
+  if (!node) return ''
+  if (!Array.isArray(node.children)) return (node.nodeValue ?? '').trim()
+  const parts = []
+  for (const c of node.children) {
+    if (c.nodeType === NODE_TYPE_TEXT && c.nodeValue) parts.push(c.nodeValue)
+  }
+  return parts.join('').replace(/\s+/g, ' ').trim()
+}
+
+function countNodes(arr) {
+  let n = 0
+  const walk = (x) => {
+    if (Array.isArray(x)) { x.forEach(walk); return }
+    if (!x || typeof x !== 'object') return
+    n++
+    if (x.children) walk(x.children)
+  }
+  walk(arr)
+  return n
+}
+
+function countNamed(treeOrArray) {
+  let n = 0
+  const walk = (x) => {
+    if (Array.isArray(x)) { x.forEach(walk); return }
+    if (!x || typeof x !== 'object') return
+    if (x.name) n++
+    if (x.children) walk(x.children)
+  }
+  walk(treeOrArray)
+  return n
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -214,8 +585,12 @@ function trim(s, n) {
   return t.length > n ? t.slice(0, n) + '…' : t
 }
 
+function truncateMsg(s) {
+  if (!s) return ''
+  return String(s).length > 120 ? String(s).slice(0, 120) + '…' : String(s)
+}
+
 function hashEtag(obj) {
-  // FNV-1a over JSON — small, fast, no deps.
   const s = JSON.stringify(obj)
   let h = 0x811c9dc5
   for (let i = 0; i < s.length; i++) {

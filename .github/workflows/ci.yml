@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+
+      - name: Parse-check all JS files (bridge/, extension/, skill/)
+        run: |
+          set -e
+          mapfile -t files < <(find bridge extension skill \
+            -type f -name '*.js' \
+            -not -path '*/node_modules/*')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No JS files found"
+            exit 0
+          fi
+          echo "Parse-checking ${#files[@]} file(s)..."
+          for f in "${files[@]}"; do
+            node --check "$f"
+          done
+
+      - name: Validate extension/manifest.json (MV3 shape)
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const m = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+            const errs = [];
+            if (m.manifest_version !== 3) errs.push("manifest_version must be 3");
+            if (!Array.isArray(m.permissions)) errs.push("permissions must be an array");
+            if (!Array.isArray(m.host_permissions)) errs.push("host_permissions must be an array");
+            if (!m.background || typeof m.background.service_worker !== "string") {
+              errs.push("background.service_worker must be a string");
+            }
+            if (errs.length) {
+              console.error("manifest.json invalid:\n - " + errs.join("\n - "));
+              process.exit(1);
+            }
+            console.log("manifest.json OK (MV3, sw=" + m.background.service_worker + ")");
+          '
+
+      - name: Install bridge deps (npm ci)
+        working-directory: bridge
+        run: npm ci
+
+      # NOTE: bridge/src/index.js calls main() at module-load time, which binds
+      # the WS port. There is no CI guard env var, so we skip the dry-load step
+      # to avoid starting a server in CI. `node --check` + `npm ci` already
+      # cover syntax + dependency resolution. Add a guard (e.g. `if (process.env.CI)
+      # return`) in src/index.js if you want a real import-smoke test here.
+
+  audit:
+    name: npm audit (bridge)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+
+      - name: Audit (warn-only on high)
+        working-directory: bridge
+        run: npm audit --audit-level=high
