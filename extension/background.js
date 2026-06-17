@@ -264,8 +264,39 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 })
 chrome.debugger.onDetach.addListener((source, reason) => {
   console.warn('[qqb] debugger detached', source, reason)
+  // Reasons we care about:
+  //   • 'target_closed'  — tab was closed
+  //   • 'canceled_by_user' — user clicked the yellow bar's "cancel"
+  //   • 'replaced_with_devtools' — DevTools opened on this tab
+  //   • 'renderer_crashed' (newer) / 'crashed' — renderer process died
+  // The crash reasons are the ones that matter for diagnosis: we want to
+  // surface them prominently so the user can correlate to "Aw, Snap" pages.
+  if (typeof reason === 'string' && /crash/i.test(reason)) {
+    console.error(
+      `[qqb] ⚠ render process crashed for tab ${source?.tabId} (reason="${reason}"). ` +
+      `If you see "Aw, Snap! error 5" on the page, the most likely culprit is a ` +
+      `recent CDP call against this tab — check the previous log lines for which ` +
+      `method was in flight.`
+    )
+  }
+  // Sync interact.js's ATTACHED set so a subsequent qqb call doesn't think
+  // we're still attached to a dead tab.
+  if (source?.tabId != null) detachTab(source.tabId).catch(() => {})
   pushTabsToBridge()
 })
+
+// Inspector.targetCrashed fires before onDetach when the renderer dies. Log it
+// loudly so the SW console shows the exact moment of crash relative to the
+// last CDP method we issued.
+if (chrome.debugger.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (method === 'Inspector.targetCrashed') {
+      console.error(
+        `[qqb] ⚠ Inspector.targetCrashed for tab ${source?.tabId}`, params ?? ''
+      )
+    }
+  })
+}
 
 // ── Service worker boot ──────────────────────────────────────────────────────
 

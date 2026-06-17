@@ -79,6 +79,29 @@ const NODE_TYPE_DOCUMENT_FRAGMENT = 11
 // Hard cap on iframe recursion depth.
 const MAX_FRAME_DEPTH = 3
 
+// Full-page screenshot caps (defensive — see runDomSnapshot / ax-tree
+// concerns: Chromium can crash the render process when asked to render
+// excessively tall documents in one capture).
+export const MAX_FULLPAGE_HEIGHT_PX = 16000
+
+// Same-origin check helper for cross-frame walking. Returns true if the
+// child frame URL is same-origin with the parent (so getFullAXTree is safe),
+// false otherwise — including all opaque/about:/data: schemes which we
+// classify as cross-origin out of caution.
+export function isSameOrigin(parentUrl, childUrl) {
+  if (!parentUrl || !childUrl) return false
+  // about:blank / about:srcdoc inherit the embedder's origin in practice and
+  // are safe to walk.
+  if (childUrl === 'about:blank' || childUrl.startsWith('about:srcdoc')) return true
+  try {
+    const p = new URL(parentUrl)
+    const c = new URL(childUrl)
+    return p.origin === c.origin
+  } catch {
+    return false
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -164,10 +187,16 @@ async function runAxSnapshot(ctx) {
   const topCompact = compactAxNodes(topNodes, ctx)
 
   // 3. Walk child frames (depth-first) and graft them into the top tree.
+  // The parent URL drives the same-origin check inside graftChildFrames —
+  // we never issue getFullAXTree against a cross-origin frameId, because on
+  // some Chromium-derived browsers (notably QQ Browser) that call has been
+  // observed to crash the render process (Aw-Snap, error 5) instead of
+  // rejecting the CDP request.
   let framesMerged = 0
+  const parentUrl = frameTree?.frame?.url ?? null
   if (frameTree?.childFrames?.length) {
     framesMerged = await graftChildFrames(
-      ctx, topCompact.tree, frameTree.childFrames, /* depth */ 1
+      ctx, topCompact.tree, frameTree.childFrames, /* depth */ 1, parentUrl
     )
   }
 
@@ -182,8 +211,18 @@ async function runAxSnapshot(ctx) {
  * Recursively walk `childFrames` from CDP, fetch each frame's AX tree, and
  * graft each child's compacted children into the matching Iframe leaf in
  * `parentTree`. Returns the number of frames successfully merged.
+ *
+ * `parentUrl` is the URL of the frame whose AX tree contains parentTree.
+ * It's used to decide same-origin vs cross-origin for each child:
+ *   • same-origin → safe to call Accessibility.getFullAXTree({frameId}).
+ *   • cross-origin → SKIPPED entirely; we never issue the CDP call. This
+ *     is a defensive measure: on Chromium-derived browsers (incl. QQ
+ *     Browser) cross-origin getFullAXTree has been observed to crash the
+ *     renderer (Aw-Snap, STATUS_ACCESS_VIOLATION / error 5) rather than
+ *     rejecting the request. The placeholder leaves the iframe visible in
+ *     the snapshot but unwalked.
  */
-async function graftChildFrames(ctx, parentTree, childFrames, depth) {
+async function graftChildFrames(ctx, parentTree, childFrames, depth, parentUrl) {
   if (depth > MAX_FRAME_DEPTH) return 0
   let merged = 0
 
@@ -196,19 +235,27 @@ async function graftChildFrames(ctx, parentTree, childFrames, depth) {
   for (let i = 0; i < childFrames.length; i++) {
     const child = childFrames[i]
     const frameId = child.frame?.id
+    const childUrl = child.frame?.url ?? null
     const target = iframeLeaves[i] ?? null
+    const sameOrigin = isSameOrigin(parentUrl, childUrl)
 
     let childCompact = null
     let frameError = null
-    try {
-      if (!frameId) throw new Error('missing frameId')
-      if (ctx.remaining <= 0) throw new Error('node budget exhausted')
-      const { nodes } = await sendDebugger(
-        ctx.tabId, 'Accessibility.getFullAXTree', { frameId }
-      )
-      childCompact = compactAxNodes(nodes, ctx)
-    } catch (e) {
-      frameError = e
+
+    if (!sameOrigin) {
+      // Cross-origin — DO NOT issue getFullAXTree. Just record a placeholder.
+      frameError = new Error('cross-origin (not walked)')
+    } else {
+      try {
+        if (!frameId) throw new Error('missing frameId')
+        if (ctx.remaining <= 0) throw new Error('node budget exhausted')
+        const { nodes } = await sendDebugger(
+          ctx.tabId, 'Accessibility.getFullAXTree', { frameId }
+        )
+        childCompact = compactAxNodes(nodes, ctx)
+      } catch (e) {
+        frameError = e
+      }
     }
 
     if (target) {
@@ -222,21 +269,20 @@ async function graftChildFrames(ctx, parentTree, childFrames, depth) {
           role: 'frame',
           name: '(unavailable)',
           frameId: frameId ?? null,
+          url: childUrl ?? undefined,
           ...(frameError ? { error: truncateMsg(frameError.message) } : {}),
         }])
       }
     }
 
-    // Recurse into grandchildren regardless of whether we could graft this
-    // level — some pages have nested same-origin frames inside a cross-origin
-    // wrapper.
+    // Recurse into grandchildren only when we successfully walked this level
+    // AND the result was same-origin (so the grandchild origin check has a
+    // meaningful parentUrl). If we couldn't graft, the child URL is the
+    // correct parent for any nested frames.
     if (child.childFrames?.length && depth < MAX_FRAME_DEPTH) {
-      // For grafting at deeper levels we walk the *child*'s tree, not the
-      // parent's. If the AX call failed we have no tree to graft into, so
-      // skip.
       if (childCompact && childCompact.tree.length > 0) {
         merged += await graftChildFrames(
-          ctx, childCompact.tree, child.childFrames, depth + 1
+          ctx, childCompact.tree, child.childFrames, depth + 1, childUrl
         )
       }
     }
@@ -482,17 +528,21 @@ async function walkDomNode(ctx, node) {
 
   // Only call getBoxModel for interactive-ish nodes — it's expensive and
   // can throw for offscreen elements. Best-effort only.
+  // Defensive: skip the call entirely if backendNodeId is missing/zero. On
+  // some Chromium-derived browsers, getBoxModel against a stale or detached
+  // node can crash the renderer rather than rejecting cleanly.
   const isInteractive = DOM_INTERACTIVE_TAGS.has(tag) || Boolean(attrs.role)
-  if (isInteractive) {
+  if (isInteractive && node.backendNodeId) {
     try {
       const bb = await sendDebugger(ctx.tabId, 'DOM.getBoxModel', {
         backendNodeId: node.backendNodeId,
       })
       const m = bb?.model
-      if (m && m.width > 0 && m.height > 0) {
+      if (m && Number.isFinite(m.width) && Number.isFinite(m.height) && m.width > 0 && m.height > 0) {
         // m.content is [x1,y1, x2,y1, x2,y2, x1,y2]
         const c = m.content
-        if (Array.isArray(c) && c.length >= 8) {
+        if (Array.isArray(c) && c.length >= 8 &&
+            c.every((n) => Number.isFinite(n))) {
           out.bbox = {
             x: c[0], y: c[1],
             w: m.width, h: m.height,
@@ -500,7 +550,7 @@ async function walkDomNode(ctx, node) {
         }
       }
     } catch {
-      // offscreen / non-rendered — skip bbox quietly
+      // offscreen / non-rendered / detached — skip bbox quietly
     }
   }
 

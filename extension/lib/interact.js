@@ -5,6 +5,8 @@
 // that gate on `isTrusted`).
 
 import { cdp } from './cdp.js'
+import { MAX_FULLPAGE_HEIGHT_PX } from './ax-tree.js'
+import { MAX_FULLPAGE_HEIGHT_PX } from './ax-tree.js'
 
 const ATTACHED = new Set()
 const REF_TABLES = new Map() // tabId → { nodeRef → {axId, backendDOMNodeId} }
@@ -410,6 +412,9 @@ export async function screenshot(tabId, params) {
     clipMeta = box
   } else if (params.fullPage) {
     // Full page: capture beyond viewport at the document's full size.
+    // Defensive: cap height at MAX_FULLPAGE_HEIGHT_PX. Asking the renderer
+    // to compose a single bitmap larger than this routinely crashes the
+    // render process (Aw-Snap, error 5) on long pages.
     const { result } = await sendDebugger(tabId, 'Runtime.evaluate', {
       expression: `(() => {
         const d = document.documentElement, b = document.body;
@@ -421,9 +426,11 @@ export async function screenshot(tabId, params) {
     })
     const dim = result?.value
     if (!dim) throw new Error('cannot read document dimensions')
-    cdpParams.clip = { x: 0, y: 0, width: dim.width, height: dim.height, scale }
+    const cappedHeight = Math.min(dim.height, MAX_FULLPAGE_HEIGHT_PX)
+    const truncatedHeight = cappedHeight < dim.height
+    cdpParams.clip = { x: 0, y: 0, width: dim.width, height: cappedHeight, scale }
     cdpParams.captureBeyondViewport = true
-    clipMeta = dim
+    clipMeta = { ...dim, height: cappedHeight, truncatedHeight, originalHeight: dim.height }
   }
   // else: viewport-only — leave clip unset
 
@@ -447,6 +454,11 @@ export async function screenshot(tabId, params) {
     dpr: clipMeta?.dpr ?? 1,
     fullPage: Boolean(params.fullPage),
     nodeRef: params.nodeRef ?? null,
+    ...(clipMeta?.truncatedHeight ? {
+      truncated: true,
+      originalHeight: clipMeta.originalHeight,
+      note: `full-page capture height capped at ${clipMeta.height}px (was ${clipMeta.originalHeight}px) to avoid renderer crash`,
+    } : {}),
   }
 }
 
