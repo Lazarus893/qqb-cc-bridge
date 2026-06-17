@@ -107,6 +107,7 @@ const COMMANDS = {
       quality: num(args.flags.quality, undefined),
       scale: num(args.flags.scale, 1),
       clean: bool(args.flags.clean, false),
+      quiet: bool(args.flags.quiet, false),
     }),
   },
   click: {

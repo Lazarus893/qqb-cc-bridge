@@ -72,7 +72,9 @@ async function dispatch(method, params) {
 
   // Pulse-before — show the breath in cyan ("working") while the action runs.
   // Best-effort: failure to inject overlay never blocks the action.
-  if (OVERLAY_METHODS.has(method)) {
+  // `quiet:true` (e.g. for the demo frame-grabber) skips overlay entirely.
+  const quiet = method === 'screenshot' && Boolean(params?.quiet)
+  if (OVERLAY_METHODS.has(method) && !quiet) {
     pulseOverlay({
       tabId,
       label,
@@ -97,7 +99,7 @@ async function dispatch(method, params) {
 
   const elapsed = Date.now() - t0
   // Pulse-after / timeline log — paint result in green or red.
-  if (OVERLAY_METHODS.has(method)) {
+  if (OVERLAY_METHODS.has(method) && !quiet) {
     const status = error ? 'error' : 'ok'
     const logLabel = error
       ? `${label} · failed (${truncate(error.message, 40)})`
